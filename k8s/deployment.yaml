@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: meridian-air
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: meridian-air
+  template:
+    metadata:
+      labels:
+        app: meridian-air
+    spec:
+      containers:
+      - name: meridian-air
+        image: ghcr.io/aisbilir/meridian-analytics:latest
+        ports:
+        - containerPort: 8080
+        envFrom:
+        - secretRef:
+            name: opensky-credentials
+
