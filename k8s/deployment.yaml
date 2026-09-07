@@ -15,7 +15,7 @@ spec:
     spec:
       containers:
       - name: meridian-air
-        image: ghcr.io/aisbilir/meridian-analytics:main-20260907103023-1ca2620 # {"$imagepolicy": "flux-system:meridian-air"}
+        image: ghcr.io/aisbilir/meridian-analytics:main-20260907103125-b6c16bd # {"$imagepolicy": "flux-system:meridian-air"}
         ports:
         - containerPort: 8080
         envFrom:
