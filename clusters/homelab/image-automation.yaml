@@ -40,7 +40,7 @@ spec:
       author:
         name: fluxcdbot
         email: fluxcdbot@users.noreply.github.com
-      messageTemplate: 'chore(images): update to {{range .Updated.Images}}{{println .}}{{end}}'
+      messageTemplate: 'chore(images): update image tags'
     push:
       branch: main
   update:
