@@ -2,34 +2,40 @@
 """Meridian Air ingester.
 
 Polls OpenSky for aircraft state vectors in a bounding box and writes them
-to a partitioned bronze layout as newline-delimited JSON.
+to PostgreSQL.
 
 Config comes from environment variables so the same image runs unchanged
 in every environment:
 
     OPENSKY_CLIENT_ID       (required)
     OPENSKY_CLIENT_SECRET   (required)
-    MERIDIAN_OUT            output directory        (default ./bronze)
+    PGHOST                  (required) database host
+    PGDATABASE              (required) database name
+    PGUSER                  (required) database user
+    PGPASSWORD              (required) database password
     MERIDIAN_BBOX           min_lat,max_lat,min_lon,max_lon
     MERIDIAN_INTERVAL       seconds between polls   (default 30)
     MERIDIAN_CREDITS        daily credit quota      (default 4000)
     MERIDIAN_ONCE           set to 1 to poll once and exit
 
+The PG* variables are read directly by libpq, so psycopg.connect() takes no
+arguments - the connection details never have to appear in this file.
+
 Run locally:
-    pip install "git+https://github.com/openskynetwork/opensky-api.git#subdirectory=python"
+    pip install "git+https://github.com/openskynetwork/opensky-api.git#subdirectory=python" "psycopg[binary]"
     export OPENSKY_CLIENT_ID=... OPENSKY_CLIENT_SECRET=...
-    MERIDIAN_ONCE=1 MERIDIAN_OUT=./tmp python ingest.py
+    export PGHOST=10.10.20.18 PGDATABASE=meridian PGUSER=meridian PGPASSWORD=...
+    MERIDIAN_ONCE=1 python ingest.py
 """
 
-import json
 import logging
 import os
 import signal
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
+import psycopg
 from opensky_api import OpenSkyApi
 
 FEED = "air"
@@ -42,7 +48,7 @@ logging.basicConfig(
 log = logging.getLogger("meridian-air")
 
 # Kubernetes sends SIGTERM before SIGKILL. Handling it means the pod exits
-# cleanly on a rollout or a spot eviction instead of being killed mid-write.
+# cleanly on a rollout instead of being killed mid-write.
 _shutdown = False
 
 
@@ -85,59 +91,87 @@ def credit_cost(bbox):
     return 4
 
 
-def to_record(state, snapshot_time, ingested_at):
-    """Flatten a StateVector into a dict. Bronze keeps everything as received."""
-    return {
-        "icao24": state.icao24,
-        "callsign": (state.callsign or "").strip() or None,
-        "origin_country": state.origin_country,
-        "time_position": state.time_position,
-        "last_contact": state.last_contact,
-        "longitude": state.longitude,
-        "latitude": state.latitude,
-        "baro_altitude": state.baro_altitude,
-        "geo_altitude": state.geo_altitude,
-        "on_ground": state.on_ground,
-        "velocity": state.velocity,
-        "true_track": state.true_track,
-        "vertical_rate": state.vertical_rate,
-        "squawk": state.squawk,
-        "spi": state.spi,
-        "position_source": state.position_source,
-        "category": state.category,
-        "_feed": FEED,
-        "_snapshot_time": snapshot_time,
-        "_ingested_at": ingested_at,
-    }
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+
+INSERT_SQL = """
+INSERT INTO aircraft_states (
+    icao24, snapshot_time, callsign, origin_country,
+    time_position, last_contact, longitude, latitude,
+    baro_altitude, geo_altitude, on_ground, velocity,
+    true_track, vertical_rate, squawk, spi,
+    position_source, category
+) VALUES (
+    %s, %s, %s, %s,
+    %s, %s, %s, %s,
+    %s, %s, %s, %s,
+    %s, %s, %s, %s,
+    %s, %s
+)
+ON CONFLICT (icao24, snapshot_time) DO NOTHING
+"""
 
 
-def write_bronze(out_dir, snapshot_time, records):
-    """Write one snapshot to /{feed}/dt=YYYY-MM-DD/hr=HH/.
+def to_timestamp(unix_seconds):
+    """Unix seconds to an aware datetime, or None."""
+    if unix_seconds is None:
+        return None
+    return datetime.fromtimestamp(unix_seconds, tz=timezone.utc)
 
-    The file is named for the snapshot timestamp and skipped if it already
-    exists, so a restart or a re-run produces no duplicates. Bronze is
-    partitioned by ingestion time, not event time.
+
+def to_row(state, snapshot_time):
+    """Flatten a StateVector into a tuple matching INSERT_SQL's column order."""
+    return (
+        state.icao24,
+        to_timestamp(snapshot_time),
+        (state.callsign or "").strip() or None,
+        state.origin_country,
+        to_timestamp(state.time_position),
+        to_timestamp(state.last_contact),
+        state.longitude,
+        state.latitude,
+        state.baro_altitude,
+        state.geo_altitude,
+        state.on_ground,
+        state.velocity,
+        state.true_track,
+        state.vertical_rate,
+        state.squawk,
+        state.spi,
+        state.position_source,
+        state.category,
+    )
+
+
+def connect():
+    """Open a connection using the standard PG* environment variables."""
+    conn = psycopg.connect()
+    log.info("connected to postgres at %s", os.environ.get("PGHOST"))
+    return conn
+
+
+def write_states(conn, rows):
+    """Insert one snapshot. Returns (attempted, inserted).
+
+    The primary key is (icao24, snapshot_time), so re-inserting a snapshot
+    the database already holds conflicts and does nothing rather than
+    duplicating. That is what makes a pod restart safe - it may re-poll a
+    snapshot it already stored, and the second write is a no-op.
     """
-    if not records:
-        return False
+    if not rows:
+        return 0, 0
 
-    ts = datetime.fromtimestamp(snapshot_time, tz=timezone.utc)
-    part = Path(out_dir) / FEED / f"dt={ts:%Y-%m-%d}" / f"hr={ts:%H}"
-    part.mkdir(parents=True, exist_ok=True)
+    with conn.cursor() as cur:
+        cur.executemany(INSERT_SQL, rows)
+        inserted = cur.rowcount
+    conn.commit()
+    return len(rows), inserted
 
-    final = part / f"states-{snapshot_time}.ndjson"
-    if final.exists():
-        return False
 
-    # Write to a temp file and rename, so a crash never leaves a partial
-    # file that a downstream reader would treat as complete.
-    tmp = final.with_suffix(".ndjson.tmp")
-    with tmp.open("w") as f:
-        for r in records:
-            f.write(json.dumps(r) + "\n")
-    tmp.rename(final)
-    return True
-
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
 def main():
     client_id = os.environ.get("OPENSKY_CLIENT_ID")
@@ -146,7 +180,11 @@ def main():
         log.error("OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET must be set")
         sys.exit(1)
 
-    out_dir = os.environ.get("MERIDIAN_OUT", "./bronze")
+    for var in ("PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD"):
+        if not os.environ.get(var):
+            log.error("%s must be set", var)
+            sys.exit(1)
+
     interval = int(os.environ.get("MERIDIAN_INTERVAL", "30"))
     daily_credits = int(os.environ.get("MERIDIAN_CREDITS", "4000"))
     once = os.environ.get("MERIDIAN_ONCE") == "1"
@@ -163,6 +201,7 @@ def main():
 
     spent = 0
     budget_day = datetime.now(timezone.utc).date()
+    conn = connect()
 
     # The client handles the OAuth2 client-credentials flow and refreshes
     # the 30-minute token on its own.
@@ -183,15 +222,25 @@ def main():
                     if states is None or not states.states:
                         log.warning("no states returned (request failed or box is empty)")
                     else:
-                        ingested_at = datetime.now(timezone.utc).isoformat()
-                        records = [
-                            to_record(s, states.time, ingested_at) for s in states.states
-                        ]
-                        new = write_bronze(out_dir, states.time, records)
+                        rows = [to_row(s, states.time) for s in states.states]
+                        attempted, inserted = write_states(conn, rows)
                         log.info(
-                            "records=%d new_file=%s credits_used=%d/%d",
-                            len(records), new, spent, daily_credits,
+                            "records=%d inserted=%d credits_used=%d/%d",
+                            attempted, inserted, spent, daily_credits,
                         )
+                except psycopg.Error as exc:
+                    # A dropped connection is expected over a long run - the
+                    # database restarts, the network blips. Reconnect and carry
+                    # on rather than crashing the pod.
+                    log.warning("database error, reconnecting: %s", exc)
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    try:
+                        conn = connect()
+                    except Exception as reconnect_exc:
+                        log.error("reconnect failed: %s", reconnect_exc)
                 except Exception as exc:  # keep the pod alive through transient errors
                     log.exception("poll failed: %s", exc)
 
@@ -206,6 +255,10 @@ def main():
             if _shutdown:
                 break
 
+    try:
+        conn.close()
+    except Exception:
+        pass
     log.info("shutdown complete, %d credits used today", spent)
 
 

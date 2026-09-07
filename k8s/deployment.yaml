@@ -21,4 +21,5 @@ spec:
         envFrom:
         - secretRef:
             name: opensky-credentials
-
+        - secretRef:
+            name: postgres-credentials
