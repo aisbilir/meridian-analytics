@@ -32,11 +32,3 @@ jobs:
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ steps.tag.outputs.value }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:${{ github.sha }}
             ${{ env.REGISTRY }}/${{ env.IMAGE }}:latest
-      - name: Summary
-        if: github.event_name != 'pull_request'
-        run: |
-          echo "✅ Image built and pushed"
-          echo "✅ Tag: ${{ steps.tag.outputs.value }}"
-          echo "🚀 ${{ env.REGISTRY }}/${{ env.IMAGE }}"
-          echo "### ✅ Build complete" >> $GITHUB_STEP_SUMMARY
-          echo "Pushed \`${{ steps.tag.outputs.value }}\`" >> $GITHUB_STEP_SUMMARY
