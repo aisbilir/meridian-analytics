@@ -15,9 +15,16 @@ spec:
     spec:
       containers:
       - name: meridian-air
-        image: ghcr.io/aisbilir/meridian-analytics:main-20260907150021-4f6a2ab # {"$imagepolicy": "flux-system:meridian-air"}
+        image: ghcr.io/aisbilir/meridian-analytics:main-20260907044004-e55bdf2 # {"$imagepolicy": "flux-system:meridian-air"}
         ports:
         - containerPort: 8080
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "200m"
         envFrom:
         - secretRef:
             name: opensky-credentials

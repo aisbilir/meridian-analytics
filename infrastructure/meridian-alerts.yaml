@@ -1,0 +1,19 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: meridian-air
+  namespace: monitoring
+  labels:
+    release: monitoring
+spec:
+  groups:
+  - name: meridian
+    rules:
+    - alert: MeridianAirDown
+      expr: kube_deployment_status_replicas_available{deployment="meridian-air"} < 1
+      for: 2m
+      labels:
+        severity: critical
+      annotations:
+        summary: "Air ingester has no available replicas"
+        description: "meridian-air has had zero available replicas for 2 minutes."
