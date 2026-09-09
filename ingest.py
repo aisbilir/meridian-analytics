@@ -90,6 +90,7 @@ def credit_cost(bbox):
         return 3
     return 4
 
+#test comment line 93
 
 # ---------------------------------------------------------------------------
 # Database
